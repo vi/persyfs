@@ -209,5 +209,8 @@ fn main() -> anyhow::Result<()> {
         //....
     }
      */
+
+    let myfs = memory_storage::create(10, fuser::FileType::Directory);
+    fuser::mount2(myfs, mountpoint, options)
     Ok(())
 }

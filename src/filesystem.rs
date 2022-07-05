@@ -6,7 +6,7 @@ use std::{
 use crate::api::{DirentContent, DirentLocation, Ino, PersistanceLayer};
 use either::Either;
 use fuser::{FileAttr, FileType};
-use libc::{c_int, EEXIST, EIO, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, S_IFMT, RENAME_NOREPLACE, EPERM, S_IFSOCK, S_IFLNK};
+use libc::{c_int, EEXIST, EIO, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, S_IFMT, RENAME_NOREPLACE, EPERM, S_IFSOCK, S_IFLNK, EINVAL};
 use log::{debug, warn, error};
 
 const TTL: Duration = Duration::from_secs(60);
@@ -426,9 +426,12 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        //let attr = self.l.read_attr(ino) 
+        let attr = match self.l.read_attr(ino) {
+            Err(e) => return reply.error(ee(e)),
+            Ok(x) => x,
+        };
         self.opened_files.entry(ino).or_insert(AtomicU32::new(0)).fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        reply.opened(0, 0);
+        reply.opened(attr.blksize as u64, 0);
     }
 
     fn read(
@@ -442,12 +445,38 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        warn!(
-            "[Not Implemented] read(ino: {:#x?}, fh: {}, offset: {}, size: {}, \
-            flags: {:#x?}, lock_owner: {:?})",
-            ino, fh, offset, size, flags, lock_owner
-        );
-        reply.error(ENOSYS);
+        let blksize = fh;
+
+        if offset < 0 {
+            error!("Negative offset requested?");
+            return reply.error(EINVAL);
+        }
+        let mut offset = offset as u64;
+
+        let mut buffer = vec![0u8; size as usize];
+        let mut data = &mut buffer[..];
+        
+        loop {
+            let (block_n, offset_within_block) = (offset / blksize, offset % blksize);
+            match self.l.read_block(ino, block_n) {
+                Err(e) => return reply.error(ee(e)),
+                Ok(None) => {
+                    // Leave that block zeroed
+                }
+                Ok(Some(block)) => {
+                    assert!(block.len() as u64 <= blksize);
+                    let copy_length = data.len().min(block.len() - offset_within_block as usize);
+                    data[..copy_length].copy_from_slice(&block[(offset_within_block as usize)..copy_length]);
+                }
+            }
+            if (data.len() - offset_within_block as usize) <= blksize as usize {
+                break
+            }
+            offset += (blksize - offset_within_block);
+            data = &mut data[((blksize - offset_within_block) as usize)..];
+        }
+
+        reply.data(&buffer)
     }
 
     fn write(
@@ -456,24 +485,43 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         ino: u64,
         fh: u64,
         offset: i64,
-        data: &[u8],
+        buffer: &[u8],
         write_flags: u32,
         flags: i32,
         lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        debug!(
-            "[Not Implemented] write(ino: {:#x?}, fh: {}, offset: {}, data.len(): {}, \
-            write_flags: {:#x?}, flags: {:#x?}, lock_owner: {:?})",
-            ino,
-            fh,
-            offset,
-            data.len(),
-            write_flags,
-            flags,
-            lock_owner
-        );
-        reply.error(ENOSYS);
+        let blksize = fh;
+
+        if offset < 0 {
+            error!("Negative offset requested?");
+            return reply.error(EINVAL);
+        }
+        let mut offset = offset as u64;
+
+        let mut data = &buffer[..];
+        
+        loop {
+            let (block_n, offset_within_block) = (offset / blksize, offset % blksize);
+
+            let ret = if offset_within_block == 0 && data.len() >= blksize as usize {
+                // simple full block write
+                self.l.write_block(ino, block_n, data[..(blksize as usize)].to_vec())
+            } else {
+                self.l.modify_block(ino, block_n, offset_within_block as usize, &data[..(blksize - offset_within_block) as usize])
+                // partial block write
+            };
+            if let Err(e) = ret {
+                return reply.error(ee(e));
+            }
+
+            if (data.len() - offset_within_block as usize) <= blksize as usize {
+                break
+            }
+            offset += (blksize - offset_within_block);
+            data = &data[((blksize - offset_within_block) as usize)..];
+        }
+        reply.written(buffer.len() as u32);
     }
 
     fn release(
