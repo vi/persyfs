@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{atomic::AtomicU64, Arc, Mutex},
-    time::SystemTime,
+    time::SystemTime, borrow::BorrowMut,
 };
 
 use crate::api::{DirentLocation, Error, Result, dummy_fileattr};
@@ -21,14 +21,17 @@ struct MemoryStorage {
 
 pub fn create(block_size: u32, root_type: FileType) -> impl crate::api::PersistanceLayer {
     let mut ret = MemoryStorage::default();
-    ret.inode_counter = 2;
+    ret.inode_counter = 1;
     ret.new_entries_block_size = block_size;
-    let mut rootnode = dummy_fileattr();
+    let ret = Arc::new(Mutex::new(ret));
+    let rootino = ret.new_inode().unwrap();
+    assert_eq!(rootino, 1);
+    let mut rootnode = ret.read_attr(1).unwrap();
     rootnode.ino = 1;
     rootnode.blksize = block_size;
     rootnode.kind = root_type;
     rootnode.nlink = 1;
-    let ret = Arc::new(Mutex::new(ret));
+    rootnode.perm = 0o777;
     ret.write_attr(1, rootnode).unwrap();
     ret
 }
@@ -95,25 +98,25 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
 
     fn write_block(&self, ino: crate::api::Ino, block_n: u64, data: Bytes) -> Result<()> {
         let mut l = self.lock().unwrap();
+        let len = data.len();
         let c = l
             .files_content
             .entry(ino)
             .or_insert_with(|| Default::default());
         c.insert(block_n, data);
+        let attr = l.attrs.get_mut(&ino).ok_or(Error::InodeNotFound(ino))?;
+        attr.size = attr.size.max(block_n * attr.blksize as u64 + len as u64);
+        attr.blocks = attr.blocks.max(block_n+1);
         Ok(())
     }
 
-    fn read_block(&self, ino: crate::api::Ino, block_n: u64) -> Result<Option<Bytes>> {
+    fn read_block_and_filelen(&self, ino: crate::api::Ino, block_n: u64) -> Result<(Option<Bytes>, u64)> {
         let mut l = self.lock().unwrap();
-        if let Some(c) = l.files_content.get(&ino) {
-            if let Some(d) = c.get(&block_n) {
-                Ok(Some(d.clone()))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Err(Error::InodeNotFound(ino))
-        }
+        let mut l = (*l).borrow_mut();
+        let content = l.files_content.get(&ino).ok_or(Error::InodeNotFound(ino))?;
+        let attr = l.attrs.get(&ino).ok_or(Error::InodeNotFound(ino))?;
+        let maybe_block = content.get(&block_n).cloned();
+        Ok((maybe_block, attr.size))
     }
 
     fn modify_block(
@@ -124,6 +127,13 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         new_data: &[u8],
     ) -> Result<()> {
         let mut l = self.lock().unwrap();
+        let mut l = (*l).borrow_mut();
+        let attr = l.attrs.get_mut(&ino).ok_or(Error::InodeNotFound(ino))?;
+        let len = new_data.len();
+        let required_block_len = len+offset_within_block;
+        assert!(offset_within_block<=attr.blksize as usize);
+        assert!(len<=attr.blksize as usize);
+        assert!(required_block_len<=attr.blksize as usize);
         let c = l
             .files_content
             .entry(ino)
@@ -131,7 +141,12 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         let b = c
             .entry(block_n)
             .or_insert_with(|| vec![0u8; offset_within_block + new_data.len()]);
+        if b.len() < required_block_len {
+            b.resize(required_block_len, 0);
+        }
         b[offset_within_block..(offset_within_block + new_data.len())].copy_from_slice(new_data);
+        attr.size = attr.size.max(block_n * attr.blksize as u64 + len as u64 + offset_within_block as u64);
+        attr.blocks = attr.blocks.max(block_n+1);
         Ok(())
     }
 
@@ -213,7 +228,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
             None
         };
 
-        assert!(evicted_entry_to_be_unlinked.is_none() || pending_unlink.is_none());
+        assert!(evicted_entry_to_be_unlinked.is_none() || !decrement_nlinks);
 
         l.attrs
             .get_mut(&entry.ino)
@@ -256,24 +271,22 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
     fn lookup(
         &self,
         root: crate::api::Ino,
-        path: Vec<crate::api::Filename>,
+        filename: crate::api::Filename,
     ) -> Result<Option<crate::api::Ino>> {
         let mut l = self.lock().unwrap();
 
         let mut cursor = root;
 
-        for x in path {
-            cursor = if let Some(y) = l
-                .dirents
-                .get(&cursor)
-                .ok_or_else(|| anyhow::anyhow!("Inode not found"))?
-                .get(&x)
-            {
-                y.ino
-            } else {
-                return Ok(None);
-            }
-        }
+        cursor = if let Some(y) = l
+            .dirents
+            .get(&cursor)
+            .ok_or_else(|| Error::DiretryNotFound(DirentLocation{dir_ino: root, filename:b"/".to_vec()}))?
+            .get(&filename)
+        {
+            y.ino
+        } else {
+            return Ok(None);
+        };
 
         Ok(Some(cursor))
     }

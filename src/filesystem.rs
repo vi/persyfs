@@ -1,13 +1,18 @@
 use std::{
+    ffi::OsStr,
     os::unix::prelude::OsStrExt,
-    time::{Duration, SystemTime}, sync::atomic::AtomicU32, ffi::OsStr,
+    sync::atomic::AtomicU32,
+    time::{Duration, SystemTime},
 };
 
 use crate::api::{DirentContent, DirentLocation, Ino, PersistanceLayer};
 use either::Either;
 use fuser::{FileAttr, FileType};
-use libc::{c_int, EEXIST, EIO, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, S_IFMT, RENAME_NOREPLACE, EPERM, S_IFSOCK, S_IFLNK, EINVAL};
-use log::{debug, warn, error};
+use libc::{
+    c_int, EEXIST, EINVAL, EIO, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, RENAME_NOREPLACE,
+    S_IFLNK, S_IFMT, S_IFSOCK,
+};
+use log::{debug, error, warn};
 
 const TTL: Duration = Duration::from_secs(60);
 
@@ -16,22 +21,29 @@ struct Filesystem<L: PersistanceLayer> {
     opened_files: dashmap::DashMap<Ino, std::sync::atomic::AtomicU32>,
 }
 
+pub fn new<L: PersistanceLayer>(l: L) -> impl fuser::Filesystem {
+    Filesystem {
+        opened_files: Default::default(),
+        l,
+    }
+}
+
 fn ee(e: crate::api::Error) -> c_int {
     match e {
         crate::api::Error::Whatever(ee) => {
-            log::error!("{}", ee);
+            log::error!("Error: {}", ee);
             EIO
         }
-        crate::api::Error::InodeNotFound(ee) => {
-            log::warn!("{}", ee);
+        crate::api::Error::InodeNotFound(ino) => {
+            log::warn!("Inode {} not found", ino);
             ENOENT
         }
         crate::api::Error::DiretryNotFound(ee) => {
-            log::debug!("{}", ee);
+            log::debug!("Dirent {} not found ", ee);
             ENOENT
         }
         crate::api::Error::AlreadyExists(ee) => {
-            log::debug!("{}", ee);
+            log::debug!("Direct {} already exists", ee);
             EEXIST
         }
     }
@@ -45,7 +57,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        match self.l.lookup(parent, vec![name.as_bytes().to_vec()]) {
+        match self.l.lookup(parent, name.as_bytes().to_vec()) {
             Ok(Some(x)) => match self.l.read_attr(x) {
                 Ok(attr) => reply.entry(&TTL, &attr, 0),
                 Err(e) => reply.error(ee(e)),
@@ -89,50 +101,50 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         reply: fuser::ReplyAttr,
     ) {
         match self.l.read_attr(ino) {
-            Ok(mut attr) => match self.l.write_attr(ino, attr) {
-                Ok(()) => {
-                    if let Some(mode) = mode {
-                        attr.perm = mode as u16;
-                    }
-                    if let Some(uid) = uid {
-                        attr.uid = uid;
-                    }
-                    if let Some(gid) = gid {
-                        attr.gid = gid;
-                    }
-                    if let Some(size) = size {
-                        attr.size = size;
-                        self.l.shrink_file(
-                            ino,
-                            (size + (attr.blksize as u64) - 1) / attr.blksize as u64,
-                        );
-                    }
-                    match _atime {
-                        Some(fuser::TimeOrNow::Now) => attr.atime = SystemTime::now(),
-                        Some(fuser::TimeOrNow::SpecificTime(t)) => attr.atime = t,
-                        None => todo!(),
-                    }
-                    match _mtime {
-                        Some(fuser::TimeOrNow::Now) => attr.mtime = SystemTime::now(),
-                        Some(fuser::TimeOrNow::SpecificTime(t)) => attr.mtime = t,
-                        None => todo!(),
-                    }
-                    if let Some(ctime) = ctime {
-                        attr.ctime = ctime;
-                    }
-                    if let Some(crtime) = crtime {
-                        attr.crtime = crtime;
-                    }
-                    if let Some(bkuptime) = bkuptime {
-                        attr.crtime = bkuptime;
-                    }
-                    if let Some(flags) = flags {
-                        attr.flags = flags;
-                    }
-                    reply.attr(&TTL, &attr)
+            Ok(mut attr) => {
+                if let Some(mode) = mode {
+                    attr.perm = mode as u16;
                 }
-                Err(e) => reply.error(ee(e)),
-            },
+                if let Some(uid) = uid {
+                    attr.uid = uid;
+                }
+                if let Some(gid) = gid {
+                    attr.gid = gid;
+                }
+                if let Some(size) = size {
+                    attr.size = size;
+                    self.l.shrink_file(
+                        ino,
+                        (size + (attr.blksize as u64) - 1) / attr.blksize as u64,
+                    );
+                }
+                match _atime {
+                    Some(fuser::TimeOrNow::Now) => attr.atime = SystemTime::now(),
+                    Some(fuser::TimeOrNow::SpecificTime(t)) => attr.atime = t,
+                    None => (),
+                }
+                match _mtime {
+                    Some(fuser::TimeOrNow::Now) => attr.mtime = SystemTime::now(),
+                    Some(fuser::TimeOrNow::SpecificTime(t)) => attr.mtime = t,
+                    None => (),
+                }
+                if let Some(ctime) = ctime {
+                    attr.ctime = ctime;
+                }
+                if let Some(crtime) = crtime {
+                    attr.crtime = crtime;
+                }
+                if let Some(bkuptime) = bkuptime {
+                    attr.crtime = bkuptime;
+                }
+                if let Some(flags) = flags {
+                    attr.flags = flags;
+                }
+                match self.l.write_attr(ino, attr) {
+                    Ok(()) => reply.attr(&TTL, &attr),
+                    Err(e) => reply.error(ee(e)),
+                }
+            }
             Err(e) => reply.error(ee(e)),
         }
     }
@@ -146,7 +158,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
 
     fn mknod(
         &mut self,
-        _req: &fuser::Request<'_>,
+        req: &fuser::Request<'_>,
         parent: u64,
         name: &std::ffi::OsStr,
         mode: u32,
@@ -167,12 +179,16 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 libc::S_IFCHR => FileType::CharDevice,
                 libc::S_IFIFO => FileType::NamedPipe,
                 _ => {
-                    return Err(crate::api::Error::Whatever(anyhow::anyhow!("Strange kind of file in mknod")));
+                    return Err(crate::api::Error::Whatever(anyhow::anyhow!(
+                        "Strange kind of file in mknod"
+                    )));
                 }
             };
             attr.perm = mode as u16;
             // what to do with `_umask`?
             attr.rdev = rdev;
+            attr.uid = req.uid();
+            attr.gid = req.gid();
             self.l.write_attr(n, attr)?;
 
             match self.l.link_unlink(
@@ -202,7 +218,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
 
     fn mkdir(
         &mut self,
-        _req: &fuser::Request<'_>,
+        req: &fuser::Request<'_>,
         parent: u64,
         name: &std::ffi::OsStr,
         mode: u32,
@@ -215,6 +231,8 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             attr = self.l.read_attr(n)?;
             attr.kind = FileType::Directory;
             attr.perm = mode as u16;
+            attr.uid = req.uid();
+            attr.gid = req.gid();
             // what to do with `_umask`?
             self.l.write_attr(n, attr)?;
 
@@ -274,7 +292,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        let n = match self.l.lookup(parent, vec![name.as_bytes().to_vec()]) {
+        let n = match self.l.lookup(parent, name.as_bytes().to_vec()) {
             Ok(Some(a)) => a,
             Ok(None) => return reply.error(ENOENT),
             Err(e) => return reply.error(ee(e)),
@@ -318,7 +336,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             let n = self.l.new_inode()?;
             attr = self.l.read_attr(n)?;
             attr.kind = FileType::Symlink;
-            attr.perm = 0777;
+            attr.perm = 0o777;
             self.l.write_attr(n, attr)?;
 
             self.l
@@ -364,8 +382,8 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             RENAME_NOREPLACE => false,
             x => {
                 log::warn!("Rename flags {} not implemented", x);
-                return reply.error(ENOSYS)
-            },
+                return reply.error(ENOSYS);
+            }
         };
         match self.l.link_unlink(
             either::Left(DirentLocation {
@@ -380,7 +398,13 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         ) {
             Ok(None) => reply.ok(),
             Ok(Some(x)) => {
-                if self.opened_files.entry(x).or_default().load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                if self
+                    .opened_files
+                    .entry(x)
+                    .or_default()
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
                     let _ = self.l.maybe_remove_inode(x);
                 }
                 reply.ok();
@@ -405,7 +429,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             match self.l.link_unlink(
                 either::Right(DirentContent {
                     ino,
-                    kind: attr.kind
+                    kind: attr.kind,
                 }),
                 Some(DirentLocation {
                     dir_ino: newparent,
@@ -417,7 +441,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 Some(_) => unreachable!(),
             }
 
-           Ok(attr)
+            Ok(attr)
         };
         match code() {
             Ok(attr) => reply.entry(&TTL, &attr, 0),
@@ -430,7 +454,10 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             Err(e) => return reply.error(ee(e)),
             Ok(x) => x,
         };
-        self.opened_files.entry(ino).or_insert(AtomicU32::new(0)).fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.opened_files
+            .entry(ino)
+            .or_insert(AtomicU32::new(0))
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         reply.opened(attr.blksize as u64, 0);
     }
 
@@ -451,29 +478,41 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             error!("Negative offset requested?");
             return reply.error(EINVAL);
         }
+        let original_offset = offset;
         let mut offset = offset as u64;
 
         let mut buffer = vec![0u8; size as usize];
         let mut data = &mut buffer[..];
-        
+
+        let mut fsz = 0;
         loop {
             let (block_n, offset_within_block) = (offset / blksize, offset % blksize);
-            match self.l.read_block(ino, block_n) {
+            match self.l.read_block_and_filelen(ino, block_n) {
                 Err(e) => return reply.error(ee(e)),
-                Ok(None) => {
+                Ok((None, fsz_)) => {
+                    fsz = fsz_;
                     // Leave that block zeroed
                 }
-                Ok(Some(block)) => {
+                Ok((Some(block), fsz_)) => {
                     assert!(block.len() as u64 <= blksize);
+                    fsz = fsz_;
                     let copy_length = data.len().min(block.len() - offset_within_block as usize);
-                    data[..copy_length].copy_from_slice(&block[(offset_within_block as usize)..copy_length]);
+                    data[..copy_length]
+                        .copy_from_slice(&block[(offset_within_block as usize)..(offset_within_block as usize + copy_length)]);
                 }
             }
             if (data.len() - offset_within_block as usize) <= blksize as usize {
-                break
+                break;
             }
             offset += (blksize - offset_within_block);
             data = &mut data[((blksize - offset_within_block) as usize)..];
+        }
+        if buffer.len() as u64 + original_offset as u64 > fsz {
+            if original_offset as u64 <= fsz {
+                buffer.resize((fsz - original_offset as u64) as usize, 0);
+            } else {
+                buffer.clear();
+            }
         }
 
         reply.data(&buffer)
@@ -500,23 +539,39 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         let mut offset = offset as u64;
 
         let mut data = &buffer[..];
-        
+
         loop {
             let (block_n, offset_within_block) = (offset / blksize, offset % blksize);
-
+            let write_limit = data
+                .len()
+                .min(blksize as usize - offset_within_block as usize);
+            debug!(
+                "Writing block {} from offset {} to inode {}. Remaining {} bytes of data to write. write_limit={}",
+                block_n,
+                offset_within_block,
+                ino,
+                data.len(),
+                write_limit,
+            );
             let ret = if offset_within_block == 0 && data.len() >= blksize as usize {
                 // simple full block write
-                self.l.write_block(ino, block_n, data[..(blksize as usize)].to_vec())
+                self.l
+                    .write_block(ino, block_n, data[..write_limit].to_vec())
             } else {
-                self.l.modify_block(ino, block_n, offset_within_block as usize, &data[..(blksize - offset_within_block) as usize])
+                self.l.modify_block(
+                    ino,
+                    block_n,
+                    offset_within_block as usize,
+                    &data[..write_limit],
+                )
                 // partial block write
             };
             if let Err(e) = ret {
                 return reply.error(ee(e));
             }
 
-            if (data.len() - offset_within_block as usize) <= blksize as usize {
-                break
+            if (data.len().saturating_sub(offset_within_block as usize)) <= blksize as usize {
+                break;
             }
             offset += (blksize - offset_within_block);
             data = &data[((blksize - offset_within_block) as usize)..];
@@ -539,7 +594,9 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 self.l.maybe_remove_inode(ino);
             }
         }
-        self.opened_files.remove_if(&ino, |_,x|x.load(std::sync::atomic::Ordering::SeqCst) == 0);
+        self.opened_files.remove_if(&ino, |_, x| {
+            x.load(std::sync::atomic::Ordering::SeqCst) == 0
+        });
         reply.ok();
     }
 
@@ -550,7 +607,10 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         _flags: i32,
         reply: fuser::ReplyOpen,
     ) {
-        self.opened_files.entry(ino).or_insert(AtomicU32::new(0)).fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.opened_files
+            .entry(ino)
+            .or_insert(AtomicU32::new(0))
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         reply.opened(0, 0);
     }
 
@@ -566,8 +626,23 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             Ok(d) => d,
             Err(e) => return reply.error(ee(e)),
         };
+        debug!("Received {} entries", dir.len());
+        if offset as usize > dir.len() {
+            return reply.ok();
+        }
         for (offset_offset, (name, dec)) in dir[offset as usize..].iter().enumerate() {
-            if reply.add(ino, offset+offset_offset as i64, dec.kind, OsStr::from_bytes(name)) {
+            debug!("Directory entry.");
+            let mut offset_to_report = offset + offset_offset as i64 + 1;
+            /*if offset_to_report as usize >= dir.len() {
+                offset_to_report = 0;
+            }*/
+            if reply.add(
+                ino,
+                offset_to_report,
+                dec.kind,
+                OsStr::from_bytes(name),
+            ) {
+                debug!("Full directory buffer.");
                 break;
             }
         }
@@ -588,8 +663,14 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
     fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
-    
-    fn access(&mut self, _req: &fuser::Request<'_>, _ino: u64, _mask: i32, reply: fuser::ReplyEmpty) {
+
+    fn access(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _mask: i32,
+        reply: fuser::ReplyEmpty,
+    ) {
         reply.ok()
     }
 }

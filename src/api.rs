@@ -51,11 +51,13 @@ pub trait PersistanceLayer {
     /// `FileAttr::nlink` should be ignored and managed by implementor. 
     fn write_attr(&self, ino: Ino, data: FileAttr) -> Result<()>;
     fn readdir(&self, ino: Ino) -> Result<Vec<(Filename, DirentContent)>>;
-    /// Write simple block at that index, without considering the file length, etc.
+    /// Write block at this block slot.
+    /// Implementor should also update file size in FileAttr
     fn write_block(&self, ino: Ino, block_n: Blocknumber, data: Bytes) -> Result<()>;
     /// Read specified block from file. Less than `FileAttr::blksize` bytes may be returned.
-    /// They are assumed zero if it is not the end of file.
-    fn read_block(&self, ino: Ino, block_n: Blocknumber) -> Result<Option<Bytes>>;
+    /// They are assumed zero if it is not the end of file. `None` means a block full of zeros (sparse region)
+    /// Additionally it should return total file size at the moment of reading.
+    fn read_block_and_filelen(&self, ino: Ino, block_n: Blocknumber) -> Result<(Option<Bytes>, u64)>;
     fn modify_block(
         &self,
         ino: Ino,
@@ -89,8 +91,7 @@ pub trait PersistanceLayer {
         allow_replace: bool,
     ) -> Result<Option<Ino>>;
 
-    /// Empty `path` should lead to the specified root.
-    fn lookup(&self, root: Ino, path: Vec<Filename>) -> Result<Option<Ino>>;
+    fn lookup(&self, root: Ino, filename: Filename) -> Result<Option<Ino>>;
 }
 
 pub fn dummy_fileattr() -> FileAttr {

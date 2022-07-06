@@ -1,4 +1,5 @@
 #![allow(unused)]
+use fuser::MountOption;
 use persy::{Config, Persy};
 
 mod api;
@@ -188,8 +189,8 @@ mod persy_storage {
     }
 }*/
 
-mod memory_storage;
 mod filesystem;
+mod memory_storage;
 
 fn main() -> anyhow::Result<()> {
     /*
@@ -210,7 +211,18 @@ fn main() -> anyhow::Result<()> {
     }
      */
 
-    let myfs = memory_storage::create(10, fuser::FileType::Directory);
-    fuser::mount2(myfs, mountpoint, options)
+    env_logger::init();
+    let mys = memory_storage::create(4096, fuser::FileType::Directory);
+    let myfs = filesystem::new(mys);
+    fuser::mount2(
+        myfs,
+        "m",
+        &[
+            MountOption::AutoUnmount,
+            MountOption::AllowOther,
+            MountOption::DefaultPermissions,
+            MountOption::FSName("persyfs".to_owned()),
+        ],
+    )?;
     Ok(())
 }
