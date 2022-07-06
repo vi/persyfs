@@ -496,12 +496,14 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 Ok((Some(block), fsz_)) => {
                     assert!(block.len() as u64 <= blksize);
                     fsz = fsz_;
-                    let copy_length = data.len().min(block.len() - offset_within_block as usize);
-                    data[..copy_length]
-                        .copy_from_slice(&block[(offset_within_block as usize)..(offset_within_block as usize + copy_length)]);
+                    if block.len() > offset_within_block as usize {
+                        let copy_length = data.len().min(block.len() - offset_within_block as usize);
+                        data[..copy_length]
+                            .copy_from_slice(&block[(offset_within_block as usize)..(offset_within_block as usize + copy_length)]);
+                    }
                 }
             }
-            if (data.len() - offset_within_block as usize) <= blksize as usize {
+            if (data.len().saturating_sub(offset_within_block as usize)) <= blksize as usize {
                 break;
             }
             offset += (blksize - offset_within_block);

@@ -49,6 +49,7 @@ pub trait PersistanceLayer {
     /// `FileAttr::nlink` may be calculated, not actually stored.
     fn read_attr(&self, ino: Ino) -> Result<FileAttr>;
     /// `FileAttr::nlink` should be ignored and managed by implementor. 
+    /// `FileAttr::size` should not be ignored, it should be recorded.
     fn write_attr(&self, ino: Ino, data: FileAttr) -> Result<()>;
     fn readdir(&self, ino: Ino) -> Result<Vec<(Filename, DirentContent)>>;
     /// Write block at this block slot.
@@ -105,7 +106,7 @@ pub fn dummy_fileattr() -> FileAttr {
         crtime: SystemTime::now(),
         kind: FileType::CharDevice,
         perm: 0777,
-        nlink: 1,
+        nlink: 0,
         uid: 0,
         gid: 0,
         rdev: 0,

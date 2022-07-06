@@ -6,6 +6,7 @@ use std::{
 
 use crate::api::{DirentLocation, Error, Result, dummy_fileattr};
 use fuser::{FileAttr, FileType};
+use log::debug;
 
 use crate::api::{Blocknumber, Bytes, DirentContent, Filename, Ino, PersistanceLayer};
 
@@ -26,13 +27,16 @@ pub fn create(block_size: u32, root_type: FileType) -> impl crate::api::Persista
     let ret = Arc::new(Mutex::new(ret));
     let rootino = ret.new_inode().unwrap();
     assert_eq!(rootino, 1);
-    let mut rootnode = ret.read_attr(1).unwrap();
+    let mut l = ret.lock().unwrap();
+    let rootnode = l.attrs.get_mut(&1).unwrap();
     rootnode.ino = 1;
     rootnode.blksize = block_size;
     rootnode.kind = root_type;
     rootnode.nlink = 1;
     rootnode.perm = 0o777;
-    ret.write_attr(1, rootnode).unwrap();
+    drop(rootnode);
+    drop(l);
+
     ret
 }
 
@@ -51,6 +55,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
     fn maybe_remove_inode(&self, ino: crate::api::Ino) -> Result<bool> {
         let mut l = self.lock().unwrap();
         if let Some(a) = l.attrs.get(&ino) {
+            log::debug!("Maybe remove inode {} with nlinks {}", ino, a.nlink);
             if a.nlink != 0 {
                 return Ok(false);
             }
@@ -113,7 +118,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
     fn read_block_and_filelen(&self, ino: crate::api::Ino, block_n: u64) -> Result<(Option<Bytes>, u64)> {
         let mut l = self.lock().unwrap();
         let mut l = (*l).borrow_mut();
-        let content = l.files_content.get(&ino).ok_or(Error::InodeNotFound(ino))?;
+        let content = l.files_content.entry(ino).or_default();
         let attr = l.attrs.get(&ino).ok_or(Error::InodeNotFound(ino))?;
         let maybe_block = content.get(&block_n).cloned();
         Ok((maybe_block, attr.size))
@@ -228,16 +233,12 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
             None
         };
 
+        debug!("evict? {}, increment? {}, decrement? {}", evicted_entry_to_be_unlinked.is_some(), increment_nlinks, decrement_nlinks);
         assert!(evicted_entry_to_be_unlinked.is_none() || !decrement_nlinks);
 
-        l.attrs
-            .get_mut(&entry.ino)
-            .ok_or(Error::InodeNotFound(entry.ino))?
-            .nlink += 1;
-
         if let Some(oe) = evicted_entry_to_be_unlinked {
-            if let Some(oe) = l.attrs.get_mut(&entry.ino) {
-                oe.nlink.saturating_sub(1);
+            if let Some(oe) = l.attrs.get_mut(&oe.ino) {
+                oe.nlink = oe.nlink.saturating_sub(1);
                 if oe.nlink == 0 {
                     ret = Some(oe.ino);
                 }
@@ -250,7 +251,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
             }
             if decrement_nlinks {
                 if let Some(e) = l.attrs.get_mut(&entry.ino) {
-                    e.nlink.saturating_sub(1);
+                    e.nlink = e.nlink.saturating_sub(1);
                     if e.nlink == 0 {
                         assert!(ret.is_none());
                         ret = Some(e.ino);
