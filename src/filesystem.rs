@@ -113,10 +113,6 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 }
                 if let Some(size) = size {
                     attr.size = size;
-                    self.l.shrink_file(
-                        ino,
-                        (size + (attr.blksize as u64) - 1) / attr.blksize as u64,
-                    );
                 }
                 match _atime {
                     Some(fuser::TimeOrNow::Now) => attr.atime = SystemTime::now(),

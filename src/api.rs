@@ -49,7 +49,7 @@ pub trait PersistanceLayer {
     /// `FileAttr::nlink` may be calculated, not actually stored.
     fn read_attr(&self, ino: Ino) -> Result<FileAttr>;
     /// `FileAttr::nlink` should be ignored and managed by implementor. 
-    /// `FileAttr::size` should not be ignored, it should be recorded.
+    /// `FileAttr::size` should not be ignored, it should be recorded. Orphaned data blocks should be removed automatically by implementor.
     fn write_attr(&self, ino: Ino, data: FileAttr) -> Result<()>;
     fn readdir(&self, ino: Ino) -> Result<Vec<(Filename, DirentContent)>>;
     /// Write block at this block slot.
@@ -66,8 +66,6 @@ pub trait PersistanceLayer {
         offset_within_block: usize,
         new_data: &[u8],
     ) -> Result<()>;
-    /// only considering blocks, not within a block
-    fn shrink_file(&self, ino: Ino, new_number_of_blocks: u64) -> Result<()>;
     fn read_symlink(&self, ino: Ino) -> Result<Bytes>;
     fn write_symlink(&self, ino: Ino, content: Bytes) -> Result<()>;
    

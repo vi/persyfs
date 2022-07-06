@@ -78,10 +78,22 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
     }
 
     fn write_attr(&self, ino: crate::api::Ino, data: fuser::FileAttr) -> Result<()> {
-        if let Some(attr) = self.lock().unwrap().attrs.get_mut(&ino) {
+        let mut l = self.lock().unwrap();
+        let mut l = &mut (*l);
+        if let Some(attr) = l.attrs.get_mut(&ino) {
             let nlinks = attr.nlink;
+            let oldfilesize = attr.size;
             *attr = data;
             attr.nlink = nlinks;
+
+            if attr.size < oldfilesize {
+                let new_number_of_blocks = (attr.size + (attr.blksize as u64) - 1) / attr.blksize as u64;
+                
+                if let Some(c) = l.files_content.get_mut(&ino) {
+                    c.retain(|block_n, _| block_n < &new_number_of_blocks);
+                }
+            }
+
             Ok(())
         } else {
             Err(Error::InodeNotFound(ino))
@@ -152,16 +164,6 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         b[offset_within_block..(offset_within_block + new_data.len())].copy_from_slice(new_data);
         attr.size = attr.size.max(block_n * attr.blksize as u64 + len as u64 + offset_within_block as u64);
         attr.blocks = attr.blocks.max(block_n+1);
-        Ok(())
-    }
-
-    fn shrink_file(&self, ino: crate::api::Ino, new_number_of_blocks: u64) -> Result<()> {
-        let mut l = self.lock().unwrap();
-
-        if let Some(c) = l.files_content.get_mut(&ino) {
-            c.retain(|block_n, _| block_n < &new_number_of_blocks);
-        }
-
         Ok(())
     }
 
