@@ -100,16 +100,6 @@ pub trait PersistanceLayer {
 #[delegate(PersistanceLayer,inhibit_automatic_where_clause="true")]
 pub struct DynPersistenceLayer(pub Box<dyn PersistanceLayer + Send>);
 
-/*
-#[ambassador::delegate_to_methods]
-#[delegate(PersistanceLayer, where="() : Sized", target_ref="as_ref")]
-impl DynPersistenceLayer {
-    fn as_ref(&self) -> &(dyn PersistanceLayer + Send) {
-        &self.0
-    }
-}
-*/
-
 pub fn dummy_fileattr() -> FileAttr {
     FileAttr {
         ino: 0,

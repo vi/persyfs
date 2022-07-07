@@ -56,6 +56,7 @@ pub fn open(
         info!("Creating new Persy database");
         Persy::create(path)?;
     }
+    debug!("Opening database");
     let persy = Persy::open_with_recover(path, config, |_| {
         recover_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
@@ -105,6 +106,7 @@ pub fn open(
         t.commit()?;
     }
 
+    info!("Opened database");
     Ok(PersyLayer { persy, new_entries_block_size: block_size })
 }
 
@@ -122,6 +124,7 @@ impl From<bincode::Error> for crate::api::Error {
 
 trait IterExt<T> {
     fn get_the_only_element(self) -> crate::api::Result<T>;
+    fn get_at_most_one_element(self) -> crate::api::Result<Option<T>>;
 }
 impl<I, T> IterExt<T> for I where I : Iterator<Item=T> {
     fn get_the_only_element(mut self) -> crate::api::Result<T> {
@@ -133,10 +136,20 @@ impl<I, T> IterExt<T> for I where I : Iterator<Item=T> {
             None => Err(Error::Whatever(anyhow::anyhow!("Failed to find expected element in a Persy index"))),
         }
     }
+    fn get_at_most_one_element(mut self) -> crate::api::Result<Option<T>> {
+        match self.next() {
+            Some(x) => match self.next() {
+                Some(_) => Err(Error::Whatever(anyhow::anyhow!("Got inconsistent element from Persy index"))),
+                None => Ok(Some(x)),
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl crate::api::PersistanceLayer for PersyLayer {
     fn new_inode(&self) -> Result<u64> {
+        debug!("new_inode");
         let mut t = self.persy.begin()?;
         let new_inode: Option<Ino> = t.get::<Dummy,u64>(names::INODE_COUNTER, &DUMMY_VALUE)?.max();
         if new_inode.is_none() {
@@ -159,6 +172,7 @@ impl crate::api::PersistanceLayer for PersyLayer {
         let fa_bin = bco().serialize(&fa)?;
         t.put::<u64,ByteVec>(names::ATTRS, new_inode, ByteVec::new(fa_bin))?;
         t.put::<Dummy,u64>(names::INODE_COUNTER, DUMMY_VALUE, new_inode+1)?;
+        debug!("new_inode commit");
         t.commit()?;
         Ok(new_inode) 
     }
@@ -188,11 +202,13 @@ impl crate::api::PersistanceLayer for PersyLayer {
         // remove filesize
         let _ = t.remove::<u64, u64>(names::FILESIZE, ino, None);
 
+        debug!("remove commit");
         t.commit()?;
         Ok(true)
     }
 
     fn read_attr(&self, ino: Ino) -> Result<FileAttr> {
+        debug!("read_addr ino={}", ino);
         let backlinks_name =format!("{}{}", ino, names::BACKLINKS);
         let block_index_name = format!("{}{}", ino, names::BLOCKS_INDEX);
         let s = self.persy.snapshot()?;
@@ -207,8 +223,9 @@ impl crate::api::PersistanceLayer for PersyLayer {
         }
 
         if attr.kind == FileType::RegularFile  {
-            let filesize: u64 = s.get::<u64, u64>(names::FILESIZE, &ino)?.get_the_only_element()?;
-            attr.size = filesize;
+            if let Some(filesize) = s.get::<u64, u64>(names::FILESIZE, &ino)?.get_at_most_one_element()? {
+                attr.size = filesize;
+            }
         }
        
         attr.blocks = 0;
@@ -228,6 +245,7 @@ impl crate::api::PersistanceLayer for PersyLayer {
     }
 
     fn write_attr(&self, attr: FileAttr) -> Result<()> {
+        debug!("write_attr ino={}", attr.ino);
         let ino = attr.ino;
         let mut t = self.persy.begin()?;
 
@@ -235,8 +253,10 @@ impl crate::api::PersistanceLayer for PersyLayer {
 
         t.put::<u64, ByteVec>(names::ATTRS, ino, ByteVec::from(attr_bin))?;
         if attr.kind == FileType::RegularFile  {
-            let old_size = t.get::<u64,u64>(names::FILESIZE, &ino)?.get_the_only_element()?;
+            debug!("Regular file mode");
+            let old_size = t.get::<u64,u64>(names::FILESIZE, &ino)?.get_at_most_one_element()?.unwrap_or(0);
             t.put::<u64, u64>(names::FILESIZE, ino, attr.size)?;
+            debug!("Old size {}, new size {}", old_size, attr.size);
 
             let new_number_of_blocks =
             (attr.size + (attr.blksize as u64) - 1) / attr.blksize as u64;
@@ -247,17 +267,20 @@ impl crate::api::PersistanceLayer for PersyLayer {
                 let block_ids_to_remove : Vec<_> = t.range::<u64, PersyId, _>(&block_index, new_number_of_blocks..)?.collect();
 
                 for bid in block_ids_to_remove {
+                    debug!("Removing block");
                     let _ = t.delete(&segment, &bid.1.get_the_only_element()?);
                     let _ = t.remove::<u64,PersyId>(&block_index, bid.0, None);
                 }
             }
         }
 
+        debug!("write_attr commit");
         t.commit()?;
         Ok(())
     }
 
     fn readdir(&self, ino: Ino) -> Result<Vec<(crate::api::Filename, crate::api::DirentContent)>> {
+        debug!("readdir ino={}", ino);
         let s = self.persy.snapshot()?;
 
         let dirs = match s.range::<ByteVec, ByteVec, _>(&format!("{}{}", ino, names::DIR_INDEX), ..) {
@@ -377,13 +400,16 @@ impl crate::api::PersistanceLayer for PersyLayer {
     }
 
     fn read_symlink(&self, ino: Ino) -> Result<Bytes> {
+        debug!("read_symlink ino={:?}", ino);
         Ok(self.persy.get::<u64, ByteVec>(names::SYMLINKS, &ino)?.get_the_only_element()?.into())
     }
 
     fn write_symlink(&self, ino: Ino, content: Bytes) -> Result<()> {
+        debug!("write_symlink ino={:?}", ino);
         let mut t = self.persy.begin()?;
         t.put::<u64, ByteVec>(names::SYMLINKS, ino, ByteVec::from(content))?;
         t.commit()?;
+        debug!("write_symlink commit");
         Ok(())
     }
 
@@ -393,6 +419,7 @@ impl crate::api::PersistanceLayer for PersyLayer {
         new: Option<crate::api::DirentLocation>,
         allow_replace: bool,
     ) -> Result<Option<Ino>> {
+        debug!("link_unlink old={:?} new={:?}", old, new);
         let mut t = self.persy.begin()?;
 
         let mut evicted_ino = None;
@@ -405,12 +432,12 @@ impl crate::api::PersistanceLayer for PersyLayer {
 
                 let mut check = t.get::<ByteVec,ByteVec>(&dir_index_name, &filename)?;
                 match check.next() {
-                    Some(x) => {
-                        let entry : DirentContent = bco().deserialize(&x)?;
+                    Some(entry_buf) => {
+                        let entry : DirentContent = bco().deserialize(&entry_buf)?;
                         
                         let backlinks_name = format!("{}{}", entry.ino, names::BACKLINKS);
-                        t.remove::<ByteVec, Dummy>(&backlinks_name, del_bytes.clone(), None)?;
-                        t.remove::<ByteVec,ByteVec>(&dir_index_name, del_bytes, None)?;
+                        t.remove::<ByteVec, Dummy>(&backlinks_name, del_bytes, None)?;
+                        t.remove::<ByteVec,ByteVec>(&dir_index_name, filename, None)?;
 
                         if new.is_none() {
                             // unlink mode
@@ -452,11 +479,13 @@ impl crate::api::PersistanceLayer for PersyLayer {
             t.put::<ByteVec, Dummy>(&backlinks_name, ByteVec::from(new_name_bytes), DUMMY_VALUE)?;
         }
 
+        debug!("link_unlink commit");
         t.commit()?;
         Ok(evicted_ino)
     }
 
     fn lookup(&self, root: Ino, filename: crate::api::Filename) -> Result<Option<Ino>> {
+        debug!("lookup root={:?} filename=`{}`", root, String::from_utf8_lossy(&filename));
         let dir_index_name = format!("{}{}", root, names::DIR_INDEX);
         let ret = self.persy.get::<ByteVec,ByteVec>(&dir_index_name, &ByteVec::from(filename));
         let mut iter = match ret {
