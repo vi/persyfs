@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicU64, Arc, Mutex},
-    time::SystemTime, borrow::BorrowMut,
+    sync::{Arc, Mutex}, borrow::BorrowMut,
 };
 
 use crate::api::{DirentLocation, Error, Result, dummy_fileattr};
@@ -79,7 +78,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
 
     fn write_attr(&self, ino: crate::api::Ino, data: fuser::FileAttr) -> Result<()> {
         let mut l = self.lock().unwrap();
-        let mut l = &mut (*l);
+        let l = &mut (*l);
         if let Some(attr) = l.attrs.get_mut(&ino) {
             let nlinks = attr.nlink;
             let oldfilesize = attr.size;
@@ -129,7 +128,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
 
     fn read_block_and_filelen(&self, ino: crate::api::Ino, block_n: u64) -> Result<(Option<Bytes>, u64)> {
         let mut l = self.lock().unwrap();
-        let mut l = (*l).borrow_mut();
+        let l = (*l).borrow_mut();
         let content = l.files_content.entry(ino).or_default();
         let attr = l.attrs.get(&ino).ok_or(Error::InodeNotFound(ino))?;
         let maybe_block = content.get(&block_n).cloned();
@@ -144,7 +143,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         new_data: &[u8],
     ) -> Result<()> {
         let mut l = self.lock().unwrap();
-        let mut l = (*l).borrow_mut();
+        let l = (*l).borrow_mut();
         let attr = l.attrs.get_mut(&ino).ok_or(Error::InodeNotFound(ino))?;
         let len = new_data.len();
         let required_block_len = len+offset_within_block;
@@ -168,7 +167,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
     }
 
     fn read_symlink(&self, ino: crate::api::Ino) -> Result<Bytes> {
-        let mut l = self.lock().unwrap();
+        let l = self.lock().unwrap();
         Ok(l.symlinks.get(&ino).ok_or(Error::InodeNotFound(ino))?).cloned()
     }
 
@@ -276,7 +275,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         root: crate::api::Ino,
         filename: crate::api::Filename,
     ) -> Result<Option<crate::api::Ino>> {
-        let mut l = self.lock().unwrap();
+        let l = self.lock().unwrap();
 
         let mut cursor = root;
 

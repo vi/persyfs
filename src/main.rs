@@ -1,6 +1,6 @@
-#![allow(unused)]
+//#![allow(unused)]
 use fuser::MountOption;
-use persy::{Config, Persy};
+
 
 mod api;
 

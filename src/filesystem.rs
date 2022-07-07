@@ -9,10 +9,9 @@ use crate::api::{DirentContent, DirentLocation, Ino, PersistanceLayer};
 use either::Either;
 use fuser::{FileAttr, FileType};
 use libc::{
-    c_int, EEXIST, EINVAL, EIO, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, RENAME_NOREPLACE,
-    S_IFLNK, S_IFMT, S_IFSOCK,
+    c_int, EEXIST, EINVAL, EIO, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, RENAME_NOREPLACE, S_IFMT,
 };
-use log::{debug, error, warn};
+use log::{debug, error};
 
 const TTL: Duration = Duration::from_secs(60);
 
@@ -166,7 +165,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             let mut attr: FileAttr;
             let n = self.l.new_inode()?;
             attr = self.l.read_attr(n)?;
-            attr.kind = match (mode & S_IFMT) {
+            attr.kind = match mode & S_IFMT {
                 libc::S_IFSOCK => FileType::Socket,
                 libc::S_IFLNK => FileType::Symlink,
                 libc::S_IFREG => FileType::RegularFile,
@@ -201,7 +200,9 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 Ok(Some(_)) => unreachable!(),
                 Ok(None) => Ok(attr),
                 Err(e) => {
-                    self.l.maybe_remove_inode(n);
+
+                    let _ = self.l.maybe_remove_inode(n);
+
                     Err(e)
                 }
             }
@@ -218,7 +219,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         parent: u64,
         name: &std::ffi::OsStr,
         mode: u32,
-        umask: u32,
+        _umask: u32,
         reply: fuser::ReplyEntry,
     ) {
         let code = move || {
@@ -246,7 +247,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 Ok(Some(_)) => unreachable!(),
                 Ok(None) => Ok(attr),
                 Err(e) => {
-                    self.l.maybe_remove_inode(n);
+                    let _ = self.l.maybe_remove_inode(n);
                     Err(e)
                 }
             }
@@ -273,7 +274,16 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             false,
         ) {
             Ok(Some(x)) => {
-                let _ = self.l.maybe_remove_inode(x);
+                let mut skip_remove = false;
+                if let Some(of) = self.opened_files.get(&x) {
+                    if of.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                        skip_remove = true;
+                    }
+                }
+                if !skip_remove {
+                    let _ = self.l.maybe_remove_inode(x);
+                }
+
                 reply.ok()
             }
             Ok(None) => reply.ok(),
@@ -299,7 +309,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                     return reply.error(ENOTEMPTY);
                 }
             }
-            Err(e) => return reply.error(ENOTDIR),
+            Err(_e) => return reply.error(ENOTDIR),
         }
         match self.l.link_unlink(
             Either::Left(DirentLocation {
@@ -311,7 +321,15 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         ) {
             Ok(Some(x)) => {
                 assert_eq!(x, n);
-                let _ = self.l.maybe_remove_inode(x);
+                let mut skip_remove = false;
+                if let Some(of) = self.opened_files.get(&x) {
+                    if of.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                        skip_remove = true;
+                    }
+                }
+                if !skip_remove {
+                    let _ = self.l.maybe_remove_inode(x);
+                }
                 reply.ok()
             }
             Ok(None) => reply.ok(),
@@ -352,7 +370,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 Ok(Some(_)) => unreachable!(),
                 Ok(None) => Ok(attr),
                 Err(e) => {
-                    self.l.maybe_remove_inode(n);
+                    let _ = self.l.maybe_remove_inode(n);
                     Err(e)
                 }
             }
@@ -418,7 +436,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         reply: fuser::ReplyEntry,
     ) {
         let code = move || {
-            let mut attr: FileAttr;
+            let attr: FileAttr;
             attr = self.l.read_attr(ino)?;
 
             let allow_replace = false;
@@ -464,8 +482,8 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         fh: u64,
         offset: i64,
         size: u32,
-        flags: i32,
-        lock_owner: Option<u64>,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
         let blksize = fh;
@@ -480,7 +498,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         let mut buffer = vec![0u8; size as usize];
         let mut data = &mut buffer[..];
 
-        let mut fsz = 0;
+        let mut fsz;
         loop {
             let (block_n, offset_within_block) = (offset / blksize, offset % blksize);
             match self.l.read_block_and_filelen(ino, block_n) {
@@ -502,7 +520,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             if (data.len().saturating_sub(offset_within_block as usize)) <= blksize as usize {
                 break;
             }
-            offset += (blksize - offset_within_block);
+            offset += blksize - offset_within_block;
             data = &mut data[((blksize - offset_within_block) as usize)..];
         }
         if buffer.len() as u64 + original_offset as u64 > fsz {
@@ -523,9 +541,9 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         fh: u64,
         offset: i64,
         buffer: &[u8],
-        write_flags: u32,
-        flags: i32,
-        lock_owner: Option<u64>,
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
         let blksize = fh;
@@ -571,7 +589,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             if (data.len().saturating_sub(offset_within_block as usize)) <= blksize as usize {
                 break;
             }
-            offset += (blksize - offset_within_block);
+            offset += blksize - offset_within_block;
             data = &data[((blksize - offset_within_block) as usize)..];
         }
         reply.written(buffer.len() as u32);
@@ -589,7 +607,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
     ) {
         if let Some(c) = self.opened_files.get(&ino) {
             if c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                self.l.maybe_remove_inode(ino);
+                let _ = self.l.maybe_remove_inode(ino);
             }
         }
         self.opened_files.remove_if(&ino, |_, x| {
@@ -630,7 +648,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
         }
         for (offset_offset, (name, dec)) in dir[offset as usize..].iter().enumerate() {
             debug!("Directory entry.");
-            let mut offset_to_report = offset + offset_offset as i64 + 1;
+            let offset_to_report = offset + offset_offset as i64 + 1;
             /*if offset_to_report as usize >= dir.len() {
                 offset_to_report = 0;
             }*/
