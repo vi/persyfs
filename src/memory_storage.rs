@@ -33,7 +33,6 @@ pub fn create(block_size: u32, root_type: FileType) -> impl crate::api::Persista
     rootnode.kind = root_type;
     rootnode.nlink = 1;
     rootnode.perm = 0o777;
-    drop(rootnode);
     drop(l);
 
     ret

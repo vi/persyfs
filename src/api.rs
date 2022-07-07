@@ -103,7 +103,7 @@ pub fn dummy_fileattr() -> FileAttr {
         ctime: SystemTime::now(),
         crtime: SystemTime::now(),
         kind: FileType::CharDevice,
-        perm: 0777,
+        perm: 0o777,
         nlink: 0,
         uid: 0,
         gid: 0,
