@@ -40,6 +40,7 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[ambassador::delegatable_trait]
 pub trait PersistanceLayer {
     /// inode numbers are not reused. Removed files's inode mumber is lost forever.
     /// Should allocate a `FileAttr` for this inode number.
@@ -48,23 +49,25 @@ pub trait PersistanceLayer {
     fn maybe_remove_inode(&self, ino: Ino) -> Result<bool>;
     /// `FileAttr::nlink` may be calculated, not actually stored.
     fn read_attr(&self, ino: Ino) -> Result<FileAttr>;
+    /// Read specifially block size (without processing the rest of `FileAttr`).
+    fn read_block_size(&self, ino: Ino) -> Result<u32>;
     /// `FileAttr::nlink` should be ignored and managed by implementor. 
     /// `FileAttr::size` should not be ignored, it should be recorded. Orphaned data blocks should be removed automatically by implementor.
-    fn write_attr(&self, ino: Ino, data: FileAttr) -> Result<()>;
+    fn write_attr(&self, attr: FileAttr) -> Result<()>;
     fn readdir(&self, ino: Ino) -> Result<Vec<(Filename, DirentContent)>>;
-    /// Write block at this block slot.
-    /// Implementor should also update file size in FileAttr
-    fn write_block(&self, ino: Ino, block_n: Blocknumber, data: Bytes) -> Result<()>;
     /// Read specified block from file. Less than `FileAttr::blksize` bytes may be returned.
     /// They are assumed zero if it is not the end of file. `None` means a block full of zeros (sparse region)
     /// Additionally it should return total file size at the moment of reading.
     fn read_block_and_filelen(&self, ino: Ino, block_n: Blocknumber) -> Result<(Option<Bytes>, u64)>;
-    fn modify_block(
+    /// Read the block (unless `offset_within_block` is 0 and new_data's length is block size), patch it using `new_data`, then write it
+    /// (or create if it didn't exist). Also set new file size if it is less than specified.
+    fn write_or_modify_block_and_maybe_filelen(
         &self,
         ino: Ino,
         block_n: u64,
         offset_within_block: usize,
         new_data: &[u8],
+        file_length_candidate: u64,
     ) -> Result<()>;
     fn read_symlink(&self, ino: Ino) -> Result<Bytes>;
     fn write_symlink(&self, ino: Ino, content: Bytes) -> Result<()>;
@@ -92,6 +95,20 @@ pub trait PersistanceLayer {
 
     fn lookup(&self, root: Ino, filename: Filename) -> Result<Option<Ino>>;
 }
+
+#[derive(ambassador::Delegate)]
+#[delegate(PersistanceLayer,inhibit_automatic_where_clause="true")]
+pub struct DynPersistenceLayer(pub Box<dyn PersistanceLayer + Send>);
+
+/*
+#[ambassador::delegate_to_methods]
+#[delegate(PersistanceLayer, where="() : Sized", target_ref="as_ref")]
+impl DynPersistenceLayer {
+    fn as_ref(&self) -> &(dyn PersistanceLayer + Send) {
+        &self.0
+    }
+}
+*/
 
 pub fn dummy_fileattr() -> FileAttr {
     FileAttr {

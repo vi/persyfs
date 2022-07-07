@@ -135,7 +135,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 if let Some(flags) = flags {
                     attr.flags = flags;
                 }
-                match self.l.write_attr(ino, attr) {
+                match self.l.write_attr(attr) {
                     Ok(()) => reply.attr(&TTL, &attr),
                     Err(e) => reply.error(ee(e)),
                 }
@@ -184,7 +184,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             attr.rdev = rdev;
             attr.uid = req.uid();
             attr.gid = req.gid();
-            self.l.write_attr(n, attr)?;
+            self.l.write_attr(attr)?;
 
             match self.l.link_unlink(
                 Either::Right(DirentContent {
@@ -231,7 +231,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             attr.uid = req.uid();
             attr.gid = req.gid();
             // what to do with `_umask`?
-            self.l.write_attr(n, attr)?;
+            self.l.write_attr(attr)?;
 
             match self.l.link_unlink(
                 Either::Right(DirentContent {
@@ -351,7 +351,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             attr = self.l.read_attr(n)?;
             attr.kind = FileType::Symlink;
             attr.perm = 0o777;
-            self.l.write_attr(n, attr)?;
+            self.l.write_attr(attr)?;
 
             self.l
                 .write_symlink(n, link.as_os_str().as_bytes().to_vec())?;
@@ -464,7 +464,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        let attr = match self.l.read_attr(ino) {
+        let blksize = match self.l.read_block_size(ino) {
             Err(e) => return reply.error(ee(e)),
             Ok(x) => x,
         };
@@ -472,7 +472,7 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
             .entry(ino)
             .or_insert(AtomicU32::new(0))
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        reply.opened(attr.blksize as u64, 0);
+        reply.opened(blksize as u64, 0);
     }
 
     fn read(
@@ -569,19 +569,15 @@ impl<L: PersistanceLayer> fuser::Filesystem for Filesystem<L> {
                 data.len(),
                 write_limit,
             );
-            let ret = if offset_within_block == 0 && data.len() >= blksize as usize {
-                // simple full block write
-                self.l
-                    .write_block(ino, block_n, data[..write_limit].to_vec())
-            } else {
-                self.l.modify_block(
+            let len_cand = block_n * blksize  + write_limit as u64 + offset_within_block as u64;
+            let ret = 
+                self.l.write_or_modify_block_and_maybe_filelen(
                     ino,
                     block_n,
                     offset_within_block as usize,
                     &data[..write_limit],
-                )
-                // partial block write
-            };
+                    len_cand,
+                );
             if let Err(e) = ret {
                 return reply.error(ee(e));
             }

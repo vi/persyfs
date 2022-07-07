@@ -1,9 +1,10 @@
 use std::{
+    borrow::BorrowMut,
     collections::HashMap,
-    sync::{Arc, Mutex}, borrow::BorrowMut,
+    sync::{Arc, Mutex},
 };
 
-use crate::api::{DirentLocation, Error, Result, dummy_fileattr};
+use crate::api::{dummy_fileattr, DirentLocation, Error, Result};
 use fuser::{FileAttr, FileType};
 use log::debug;
 
@@ -75,26 +76,35 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         }
     }
 
-    fn write_attr(&self, ino: crate::api::Ino, data: fuser::FileAttr) -> Result<()> {
+    fn read_block_size(&self, ino: Ino) -> Result<u32> {
+        if let Some(attr) = self.lock().unwrap().attrs.get(&ino) {
+            Ok(attr.blksize)
+        } else {
+            Err(Error::InodeNotFound(ino))
+        }
+    }
+
+    fn write_attr(&self, attr: fuser::FileAttr) -> Result<()> {
         let mut l = self.lock().unwrap();
         let l = &mut (*l);
-        if let Some(attr) = l.attrs.get_mut(&ino) {
-            let nlinks = attr.nlink;
-            let oldfilesize = attr.size;
-            *attr = data;
-            attr.nlink = nlinks;
+        if let Some(attr_) = l.attrs.get_mut(&attr.ino) {
+            let nlinks = attr_.nlink;
+            let oldfilesize = attr_.size;
+            *attr_ = attr;
+            attr_.nlink = nlinks;
 
-            if attr.size < oldfilesize {
-                let new_number_of_blocks = (attr.size + (attr.blksize as u64) - 1) / attr.blksize as u64;
-                
-                if let Some(c) = l.files_content.get_mut(&ino) {
+            if attr_.size < oldfilesize {
+                let new_number_of_blocks =
+                    (attr_.size + (attr_.blksize as u64) - 1) / attr_.blksize as u64;
+
+                if let Some(c) = l.files_content.get_mut(&attr.ino) {
                     c.retain(|block_n, _| block_n < &new_number_of_blocks);
                 }
             }
 
             Ok(())
         } else {
-            Err(Error::InodeNotFound(ino))
+            Err(Error::InodeNotFound(attr.ino))
         }
     }
 
@@ -111,21 +121,11 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
             .collect())
     }
 
-    fn write_block(&self, ino: crate::api::Ino, block_n: u64, data: Bytes) -> Result<()> {
-        let mut l = self.lock().unwrap();
-        let len = data.len();
-        let c = l
-            .files_content
-            .entry(ino)
-            .or_insert_with(|| Default::default());
-        c.insert(block_n, data);
-        let attr = l.attrs.get_mut(&ino).ok_or(Error::InodeNotFound(ino))?;
-        attr.size = attr.size.max(block_n * attr.blksize as u64 + len as u64);
-        attr.blocks = attr.blocks.max(block_n+1);
-        Ok(())
-    }
-
-    fn read_block_and_filelen(&self, ino: crate::api::Ino, block_n: u64) -> Result<(Option<Bytes>, u64)> {
+    fn read_block_and_filelen(
+        &self,
+        ino: crate::api::Ino,
+        block_n: u64,
+    ) -> Result<(Option<Bytes>, u64)> {
         let mut l = self.lock().unwrap();
         let l = (*l).borrow_mut();
         let content = l.files_content.entry(ino).or_default();
@@ -134,21 +134,22 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         Ok((maybe_block, attr.size))
     }
 
-    fn modify_block(
+    fn write_or_modify_block_and_maybe_filelen(
         &self,
         ino: crate::api::Ino,
         block_n: u64,
         offset_within_block: usize,
         new_data: &[u8],
+        file_length_candidate: u64,
     ) -> Result<()> {
         let mut l = self.lock().unwrap();
         let l = (*l).borrow_mut();
         let attr = l.attrs.get_mut(&ino).ok_or(Error::InodeNotFound(ino))?;
         let len = new_data.len();
-        let required_block_len = len+offset_within_block;
-        assert!(offset_within_block<=attr.blksize as usize);
-        assert!(len<=attr.blksize as usize);
-        assert!(required_block_len<=attr.blksize as usize);
+        let required_block_len = len + offset_within_block;
+        assert!(offset_within_block <= attr.blksize as usize);
+        assert!(len <= attr.blksize as usize);
+        assert!(required_block_len <= attr.blksize as usize);
         let c = l
             .files_content
             .entry(ino)
@@ -160,8 +161,12 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
             b.resize(required_block_len, 0);
         }
         b[offset_within_block..(offset_within_block + new_data.len())].copy_from_slice(new_data);
-        attr.size = attr.size.max(block_n * attr.blksize as u64 + len as u64 + offset_within_block as u64);
-        attr.blocks = attr.blocks.max(block_n+1);
+        let file_size_cand = block_n * attr.blksize as u64 + len as u64 + offset_within_block as u64;
+        assert_eq!(file_size_cand, file_length_candidate);
+        attr.size = attr
+            .size
+            .max(file_length_candidate);
+        attr.blocks = attr.blocks.max(block_n + 1);
         Ok(())
     }
 
@@ -196,11 +201,12 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
                     return Ok(None);
                 }
 
-                let a = l.dirents
+                let a = l
+                    .dirents
                     .get(&old_location.dir_ino)
                     .ok_or(Error::InodeNotFound(old_location.dir_ino))?
                     .get(&old_location.filename)
-                    .ok_or_else(||Error::DiretryNotFound(old_location.clone()))?
+                    .ok_or_else(|| Error::DiretryNotFound(old_location.clone()))?
                     .clone();
                 pending_unlink = Some(old_location);
                 a
@@ -222,7 +228,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
                 d.insert(new_location.filename, entry)
             } else {
                 if d.contains_key(&new_location.filename) {
-                    return Err(Error::AlreadyExists(new_location))
+                    return Err(Error::AlreadyExists(new_location));
                 } else {
                     d.insert(new_location.filename, entry);
                 }
@@ -233,7 +239,12 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
             None
         };
 
-        debug!("evict? {}, increment? {}, decrement? {}", evicted_entry_to_be_unlinked.is_some(), increment_nlinks, decrement_nlinks);
+        debug!(
+            "evict? {}, increment? {}, decrement? {}",
+            evicted_entry_to_be_unlinked.is_some(),
+            increment_nlinks,
+            decrement_nlinks
+        );
         assert!(evicted_entry_to_be_unlinked.is_none() || !decrement_nlinks);
 
         if let Some(oe) = evicted_entry_to_be_unlinked {
@@ -242,7 +253,7 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
                 if oe.nlink == 0 {
                     ret = Some(oe.ino);
                 }
-            } 
+            }
         }
 
         if let Some(pu) = pending_unlink {
@@ -256,14 +267,14 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
                         assert!(ret.is_none());
                         ret = Some(e.ino);
                     }
-                } 
+                }
             }
-        } 
-        
+        }
+
         if increment_nlinks {
             if let Some(e) = l.attrs.get_mut(&entry.ino) {
                 e.nlink += 1;
-            } 
+            }
         }
 
         Ok(ret)
@@ -281,7 +292,12 @@ impl PersistanceLayer for Arc<Mutex<MemoryStorage>> {
         cursor = if let Some(y) = l
             .dirents
             .get(&cursor)
-            .ok_or_else(|| Error::DiretryNotFound(DirentLocation{dir_ino: root, filename:b"/".to_vec()}))?
+            .ok_or_else(|| {
+                Error::DiretryNotFound(DirentLocation {
+                    dir_ino: root,
+                    filename: b"/".to_vec(),
+                })
+            })?
             .get(&filename)
         {
             y.ino
